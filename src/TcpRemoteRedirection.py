@@ -23,15 +23,18 @@ class Connection(object):
     TP_OPEN = 2         # 外部链接
     TP_UNKNOWN = 3      # 未知
 
-    def __init__(self, sock, addr):
+    def __init__(self, sock, addr, max_buf_size):
         self.sock = sock
         self.addr = addr
         self.create = time.time()
         self.rbuf = ""
+        self.max_buf_size = max_buf_size
+        self.rsize = 0
+        self.ssize = 0
 
     @property
     def type(self):
-        """当前连接的类型：
+        """当前连接类型
         """
         cls = type(self)
         if len(self.rbuf) >= 10:
@@ -51,6 +54,10 @@ class Connection(object):
                         return cls.TP_OPEN
             return cls.TP_UNKNOWN
 
+    @property
+    def rbuf_full(self):
+        return len(self.rbuf) >= self.max_buf_size
+
     def recv(self):
         """
         @return received size. -1表示连接断开
@@ -58,14 +65,16 @@ class Connection(object):
         rsize = 0
         try:
             while True:
-                data = self.sock.recv(1024)
+                buf_left = self.max_buf_size - len(self.rbuf)
+                data = self.sock.recv(buf_left)
                 if data:
                     self.rbuf += data
-                    if len(self.rbuf) > RemoteRedirection.max_buf_size:
-                        return -1
                     rsize += len(data)
+                    self.rsize += len(data)
+                    if self.rbuf_full:
+                        return rsize
                 else:
-                    return -1
+                    return -1   # connection closed.
         except socket.error, e:
             if e.args[0] not in (errno.EWOULDBLOCK, errno.EAGAIN):
                 return -1
@@ -77,10 +86,12 @@ class Connection(object):
         """
         ssize = 0
         try:
-            while data:
-                size = self.sock.send(data)
-                data = data[size:]
-                ssize += size
+            # while data:
+            #     size = self.sock.send(data)
+            #     data = data[size:]
+            #     ssize += size
+            ssize = self.sock.send(data)
+            self.ssize += ssize
         except socket.error, e:
             if e.args[0] not in (errno.EWOULDBLOCK, errno.EAGAIN):
                 return -1   # socket closed
@@ -94,7 +105,13 @@ class Forward(object):
         self.down = down
 
     def close(self):
-        for conn in (self.up, self.down):
+        up, down = self.up, self.down
+        if up and down:
+            fmt = "Close forward. [Up rsize/szize: %d/%d], [Down rsize/ssize: %d/%d]"
+            logging.debug(fmt, up.rsize, down.ssize, up.rsize, up.ssize)
+        else:
+            logging.debug("Close private connection.")
+        for conn in (up, down):
             if conn:
                 self.proxy._forwards.pop(conn.sock, None)
                 self.proxy.r_list.discard(conn.sock)
@@ -105,51 +122,84 @@ class Forward(object):
 
     def on_recv(self, sock):
         if self.up and sock is self.up.sock:
-            rsize = self.up.recv()
-            if rsize == -1:
-                self.close()
-            else:
-                if self.up.rbuf and self.down:
-                    self.proxy.w_list.add(self.down.sock)
+            conn, other, name = self.up, self.down, "Up"
         elif self.down and sock is self.down.sock:
-            rsize = self.down.recv()
-            if rsize == -1:
-                self.close()
-            else:
-                if self.down.rbuf and self.up:
-                    self.proxy.w_list.add(self.up.sock)
+            conn, other, name = self.down, self.up, "Down"
+        else:           # never happen
+            assert 0, "wimp out?"
+        rsize = conn.recv()
+        if rsize == -1:
+            self.close()
+        else:
+            logging.debug("Recv from %s: %d", name, rsize)
+            if isinstance(self.proxy, RRDServer) and conn and other:
+                process = self.process_up_recv \
+                                if conn is self.up else self.process_down_recv
+                rdata, sdata = process(conn.rbuf)
+                if rdata is not None:
+                    conn.rbuf = rdata
+                if sdata is not None:
+                    other.rbuf += sdata
+                    if other.rbuf:
+                        self.proxy.w_list.add(conn.sock)
+            if conn.rbuf and other:
+                self.proxy.w_list.add(other.sock)
+            if conn.rbuf_full:
+                self.proxy.r_list.discard(sock)
 
     def on_send(self, sock):
         if self.up and sock is self.up.sock:
-            ssize = self.up.send(self.down.rbuf)
-            if ssize == -1:
-                self.close()
-                return
-            self.down.rbuf = self.down.rbuf[ssize:]
-            if not self.down.rbuf:
-                self.proxy.w_list.discard(sock)
+            conn, other, name = self.up, self.down, "Up"
         elif self.down and sock is self.down.sock:
-            ssize = self.down.send(self.up.rbuf)
-            if ssize == -1:
-                self.close()
-                return
-            self.up.rbuf = self.up.rbuf[ssize:]
-            if not self.up.rbuf:
-                self.proxy.w_list.discard(sock)
+            conn, other, name = self.down, self.up, "Down"
+        else:   # never happen
+            assert 0, "wimp out?"
+        ssize = conn.send(other.rbuf)
+        if ssize == -1:
+            self.close()
+        else:
+            logging.debug("Send to %s: %d", name, ssize)
+            other.rbuf = other.rbuf[ssize:]
+            if not other.rbuf:
+                self.proxy.w_list.discard(conn.sock)
+            if not other.rbuf_full:
+                self.proxy.r_list.add(other.sock)
+
+    # ----- 对转发进行拦截(只对RRDServer有效) -----
+
+    def process_down_recv(self, data):
+        """处理从Client接收到的数据
+        @param data: 从Client接收到的数据
+        @return: (processed_recv_data, response_data)
+                processed_recv_data: 对接收到的数据进行处理, 处理完之后再转发到远程 
+                response_data: 返回给Client的数据
+                (None表示不处理)
+        """
+        return (None, None)
+
+    def process_up_recv(self, data):
+        """处理从Remote接收到的数据
+        @param data: 从Remote接收到的数据
+        @return: (processed_recv_data, response_data)
+                processed_recv_data: 对接收到的数据进行处理, 处理完之后再转发到Client
+                response_data: 返回给Remote的数据
+                (None表示不处理)
+        """
+        return (None, None)
 
 
 class RemoteRedirection(object):
-    max_buf_size = 1024*1024
-
-    def __init__(self):
+    def __init__(self, max_buf_size):
         self.forward_pool = []
         self._forwards = {}
         self.w_list = set()
         self.r_list = set()
+        self.max_buf_size = max_buf_size
 
     def get_forward_from_pool(self, sock):
         for fw in self.forward_pool:
-            if (fw.up and fw.up.sock is sock) or (fw.down and fw.down.sock is sock):
+            if (fw.up and fw.up.sock is sock) \
+                                or (fw.down and fw.down.sock is sock):
                 return fw
 
     def _call(self, sock, method):
@@ -158,11 +208,16 @@ class RemoteRedirection(object):
             fw = self.get_forward_from_pool(sock)
         if fw:
             getattr(fw, method)(sock)
+        else:   # never happen
+            logging.error("Close [unkown connection].")
+            self.r_list.discard(sock)
+            self.w_list.discard(sock)
+            sock.close()
 
 
 class RRDServer(RemoteRedirection):
-    def __init__(self, bind_addr):
-        RemoteRedirection.__init__(self)
+    def __init__(self, bind_addr, max_buf_size=1024*64, forward=None):
+        RemoteRedirection.__init__(self, max_buf_size)
         self.conn_pool = []
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(0)
@@ -172,6 +227,7 @@ class RRDServer(RemoteRedirection):
         self.server = sock
         self.r_list.add(self.server)
         self.bind_addr = bind_addr
+        self.Forward = forward if forward else Forward
 
     def get_conn_from_pool(self, sock):
         for conn in self.conn_pool:
@@ -182,7 +238,8 @@ class RRDServer(RemoteRedirection):
         timeout = 0.1
         logging.info("RRDServer is running at %s:%s" % self.bind_addr)
         while True:
-            r_list, w_list, e_list = select.select(self.r_list, self.w_list, self.r_list, timeout)
+            r_list, w_list, e_list = select.select(
+                                self.r_list, self.w_list, self.r_list, timeout)
             for sock in e_list:
                 conn = self.get_conn_from_pool(sock)
                 if conn:
@@ -198,10 +255,10 @@ class RRDServer(RemoteRedirection):
                         try:
                             client, client_addr = sock.accept()
                             client.setblocking(0)
-                            conn = Connection(client, client_addr)
+                            conn = Connection(client, client_addr, self.max_buf_size)
                             # we don't know it's a private-connection or open-connection, put it to conn_pool first.
                             self.conn_pool.append(conn) 
-                            logging.debug("Accept conn [%s:%s]" % client_addr)
+                            logging.debug("Accept [%s:%s]" % client_addr)
                             self.r_list.add(client)
                         except socket.error, e:
                             if e.args[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
@@ -219,13 +276,15 @@ class RRDServer(RemoteRedirection):
                             tp = conn.type
                             if tp == conn.TP_PRIVATE:
                                 conn.rbuf = conn.rbuf[10:]  # strip head
-                                fw = Forward(self, up=conn)
+                                fw = self.Forward(self, up=conn)
                                 self.conn_pool.remove(conn)
                                 self.forward_pool.append(fw)
+                                logging.info("Accept [private-connection]")
                             elif tp == conn.TP_OPEN:
-                                fw = Forward(self, down=conn)
+                                fw = self.Forward(self, down=conn)
                                 self.conn_pool.remove(conn)
                                 self.forward_pool.append(fw)
+                                logging.info("Accept [open-connection]")
                             else:
                                 pass    # we still don't know what's type of the connection, left it away.
                     else:
@@ -254,10 +313,11 @@ class RRDServer(RemoteRedirection):
 
 
 class RRDClient(RemoteRedirection):
-    def __init__(self, rrd_server_addr, server_addr):
-        RemoteRedirection.__init__(self)
+    def __init__(self, rrd_server_addr, server_addr, max_buf_size=1024*64, forward=None):
+        RemoteRedirection.__init__(self, max_buf_size)
         self.rrd_server_addr = rrd_server_addr
         self.server_addr = server_addr
+        self.Forward = forward if forward else Forward
 
     err_flag = False    # a flag, same error will only be loged once.
     def create_conn(self, addr):
@@ -267,9 +327,9 @@ class RRDClient(RemoteRedirection):
             sock.connect(addr)
             sock.setblocking(0)
             self.r_list.add(sock)
-            logging.debug("Create a conn to [%s:%s]" % addr)
+            # logging.debug("Create a conn to [%s:%s]" % addr)
             self.err_flag = False
-            return Connection(sock, sock.getsockname())
+            return Connection(sock, sock.getsockname(), self.max_buf_size)
         except socket.error, e:
             if e.args[0] not in (errno.EINPROGRESS, errno.EWOULDBLOCK):
                 pass    # server busy
@@ -294,9 +354,9 @@ class RRDClient(RemoteRedirection):
                 if not conn:
                     break
                 conn.sock.send("{[(%04d)]}" % random.randint(1, 9999))    # send private-connection flag
-                fw = Forward(self, down=conn)
+                fw = self.Forward(self, down=conn)
                 self.forward_pool.append(fw)
-                logging.info("Create [private-connection] to RRDServer.")
+                logging.info("Create [private-connection] to RRDServer[%s:%s]." % self.rrd_server_addr)
 
 
     def main_loop(self):
@@ -316,6 +376,7 @@ class RRDClient(RemoteRedirection):
                     else:
                         conn = self.create_conn(self.server_addr)
                         if conn:
+                            logging.info("Create [conn] to Server[%s:%s]" % self.server_addr)
                             fw.up = conn
                             self.forward_pool.remove(fw)
                             self._forwards[fw.up.sock] = fw
@@ -332,7 +393,9 @@ class RRDClient(RemoteRedirection):
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.DEBUG, 
+            format='%(asctime)s %(name)s %(levelname)s %(message)s',
+            datefmt='%m-%d %H:%M')
 
     import sys
     if sys.argv[1] == "server":
@@ -341,7 +404,7 @@ if __name__ == '__main__':
         server.main_loop()
     else:
         rrd_server = ("127.0.0.1", 1234)
-        server = ("remote-host", 3000)
+        server = ("127.0.0.1", 22)
         client = RRDClient(rrd_server, server)
         client.main_loop()
 

@@ -7,15 +7,63 @@
 import select
 import socket
 import errno
+import time
 import logging
 import mimetypes
 
 
+class Connection(object):
+    def __init__(self, sock, addr, max_buf_size):
+        self.sock = sock
+        self.addr = addr
+        self.create = time.time()
+        self.rbuf = ""
+        self.max_buf_size = max_buf_size
+
+    @property
+    def rbuf_full(self):
+        return len(self.rbuf) >= self.max_buf_size
+
+    def recv(self):
+        """
+        @return received size. -1表示连接断开
+        """
+        rsize = 0
+        try:
+            while True:
+                buf_left = self.max_buf_size - len(self.rbuf)
+                data = self.sock.recv(buf_left)
+                if data:
+                    self.rbuf += data
+                    rsize += len(data)
+                    if self.rbuf_full:
+                        return rsize
+                else:
+                    return -1   # connection closed.
+        except socket.error, e:
+            if e.args[0] not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return -1
+        return rsize
+
+    def send(self, data):
+        """
+        @return sended size, -1表示连接断开
+        """
+        ssize = 0
+        try:
+            # while data:
+            #     size = self.sock.send(data)
+            #     data = data[size:]
+            #     ssize += size
+            ssize = self.sock.send(data)
+        except socket.error, e:
+            if e.args[0] not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return -1   # socket closed
+        return ssize
+
+
 class Forward(object):
     def __init__(self, proxy, client, client_addr):
-        self.proxy = proxy
-        self.client = client
-        self.client_addr = client_addr
         remote_addr = proxy.remote_addr
         remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -25,82 +73,95 @@ class Forward(object):
             remote.close()
             client.close()
             return
-
-        # connect to remote-host success
         remote.setblocking(0)
-        self.remote = remote
-        self.remote_send_buf = ""
-        self.client_send_buf = ""
+
+        self.proxy = proxy
+        self.down = Connection(client, client_addr, self.proxy.max_buf_size)
+        self.up = Connection(remote, remote_addr, self.proxy.max_buf_size)
         proxy._forwards[client] = self
         proxy._forwards[remote] = self
-        proxy.r_list.add(self.client)
-        proxy.r_list.add(self.remote)
+        proxy.r_list.add(client)
+        proxy.r_list.add(remote)
 
     def close(self):
-        for sock in (self.client, self.remote):
+        for conn in (self.up, self.down):
+            sock = conn.sock
             self.proxy._forwards.pop(sock, None)
             self.proxy.r_list.discard(sock)
             self.proxy.w_list.discard(sock)
             sock.close()
 
     def on_recv(self, sock):
-        rdata = []
-        try:
-            while True:
-                data = sock.recv(1024)
-                if not data:
-                    self.close()
-                    return
-                rdata.append(data)
-        except socket.error, e:
-            if e.args[0] not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                self.close()
-                return
+        if self.up.sock is sock:
+            conn, other, name = self.up, self.down, "Up"
+        elif self.down.sock is sock:
+            conn, other, name = self.down, self.up, "Down"
+        else:   # never happen
+            assert 0, "wimp out?"
 
-        data = "".join(rdata)
-        if not data:
-            return
-        if sock is self.client:
-            logging.debug("Recv from client:\n%s", data)
-            self.remote_send_buf += data
-            if len(self.remote_send_buf) > self.proxy.max_buf_size:
-                logging.warning("Remote send buffer out of size")
-                self.close()
-                return
-            self.proxy.w_list.add(self.remote)
-        elif sock is self.remote:
-            self.client_send_buf += data
-            if len(self.client_send_buf) > self.proxy.max_buf_size:
-                logging.warning("Client send buffer out of size")
-                self.close()
-                return
-            self.proxy.w_list.add(self.client)
+        rsize = conn.recv()
+        if rsize == -1:
+            self.close()
+        else:
+            logging.debug("Recv from %s: %d", name, rsize)
+            process = self.process_up_recv if conn is self.up else self.process_down_recv
+            rdata, sdata = process(conn.rbuf)
+            if rdata is not None:
+                conn.rbuf = rdata
+            if sdata is not None:
+                other.rbuf += sdata
+                if other.rbuf:
+                    self.proxy.w_list.add(conn.sock)
+            if conn.rbuf:
+                self.proxy.w_list.add(other.sock)
+            if conn.rbuf_full:
+                self.proxy.r_list.discard(conn.sock)
 
     def on_send(self, sock):
-        try:
-            if sock is self.client:
-                if self.client_send_buf:
-                    size = sock.send(self.client_send_buf)
-                    self.client_send_buf = self.client_send_buf[size:]
-                    if not self.client_send_buf:
-                        self.proxy.w_list.discard(sock)
-                else:
-                    self.proxy.w_list.discard(sock)
-            elif sock is self.remote:
-                if self.remote_send_buf:
-                    size = sock.send(self.remote_send_buf)
-                    self.remote_send_buf = self.remote_send_buf[size:]
-                    if not self.remote_send_buf:
-                        self.proxy.w_list.discard(sock)
-                else:
-                    self.proxy.w_list.discard(sock)
-        except socket.error, e:
-            if e.args[0] not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                self.close()
+        if self.up.sock is sock:
+            conn, other, name = self.up, self.down, "Up"
+        elif self.down.sock is sock:
+            conn, other, name = self.down, self.up, "Down"
+        else:   # never happen
+            assert 0, "wimp out?"
+        if not other.rbuf:
+            return
+        ssize = conn.send(other.rbuf)
+        if ssize == -1:
+            self.close()
+        else:
+            logging.debug("Send to %s: %d", name, ssize)
+            other.rbuf = other.rbuf[ssize:]
+            if not other.rbuf:
+                self.proxy.w_list.discard(conn.sock)
+            if not other.rbuf_full:
+                self.proxy.r_list.add(other.sock)
+
+    # ----- 对转发进行拦截 -----
+
+    def process_down_recv(self, data):
+        """处理从Client接收到的数据
+        @param data: 从Client接收到的数据
+        @return: (processed_recv_data, response_data)
+                processed_recv_data: 对接收到的数据进行处理, 处理完之后再转发到远程 
+                response_data: 返回给Client的数据
+                (None表示不处理)
+        """
+        return (None, None)
+
+    def process_up_recv(self, data):
+        """处理从Remote接收到的数据
+        @param data: 从Remote接收到的数据
+        @return: (processed_recv_data, response_data)
+                processed_recv_data: 对接收到的数据进行处理, 处理完之后再转发到Client
+                response_data: 返回给Remote的数据
+                (None表示不处理)
+        """
+        return (None, None)
 
 
-class LocalRedirection(object):
-    def __init__(self, bind_addr, remote_addr, max_buf_size=1024*1024):
+class TcpLocalRedirection(object):
+    def __init__(self, bind_addr, remote_addr, max_buf_size=1024*64, forward=None):
         self.bind_addr = bind_addr
         self.remote_addr = remote_addr
         self.max_buf_size = max_buf_size
@@ -111,6 +172,7 @@ class LocalRedirection(object):
         sock.bind(bind_addr)
         sock.listen(200)
         self.server = sock
+        self.Forward = forward if forward else Forward
 
         self._forwards = {}
         self.w_list = set()
@@ -122,6 +184,11 @@ class LocalRedirection(object):
             forward = self._forwards.get(sock)
             if forward:
                 getattr(forward, method)(sock)
+            else:
+                logging.error("Close [unkown connection].")
+                self.r_list.discard(sock)
+                self.w_list.discard(sock)
+                sock.close()
 
         timeout = 0.1
         while True:
@@ -134,8 +201,8 @@ class LocalRedirection(object):
                         try:
                             client, client_addr = sock.accept()
                             client.setblocking(0)
-                            logging.debug("Accept conn[%s:%s]" % client_addr)
-                            Forward(self, client, client_addr)
+                            logging.info("Accept conn[%s:%s]" % client_addr)
+                            self.Forward(self, client, client_addr)
                         except socket.error, e:
                             if e.args[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
                                 break
@@ -148,7 +215,9 @@ class LocalRedirection(object):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
-    lrd = LocalRedirection(("127.0.0.1", 1213), ("your-host", 80))
+    bind_addr = ("127.0.0.1", 1234)
+    remote_addr = ("127.0.0.1", 22)
+    lrd = TcpLocalRedirection(bind_addr, remote_addr)
     lrd.main_loop()
 
 
