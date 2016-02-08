@@ -66,6 +66,8 @@ class Connection(object):
         try:
             while True:
                 buf_left = self.max_buf_size - len(self.rbuf)
+                # if buf_left <= 0:
+                #     break
                 data = self.sock.recv(buf_left)
                 if data:
                     self.rbuf += data
@@ -97,6 +99,10 @@ class Connection(object):
                 return -1   # socket closed
         return ssize
 
+    @property
+    def connected(self):
+        return self.recv() != -1
+
 
 class Forward(object):
     def __init__(self, proxy, up=None, down=None):
@@ -108,7 +114,7 @@ class Forward(object):
         up, down = self.up, self.down
         if up and down:
             fmt = "Close forward. [Up rsize/szize: %d/%d], [Down rsize/ssize: %d/%d]"
-            logging.debug(fmt, up.rsize, down.ssize, up.rsize, up.ssize)
+            logging.debug(fmt, up.rsize, up.ssize, down.rsize, down.ssize)
         else:
             logging.debug("Close private connection.")
         for conn in (up, down):
@@ -165,6 +171,7 @@ class Forward(object):
             if not other.rbuf_full:
                 self.proxy.r_list.add(other.sock)
 
+
     # ----- 对转发进行拦截(只对RRDServer有效) -----
 
     def process_down_recv(self, data):
@@ -194,6 +201,7 @@ class RemoteRedirection(object):
         self._forwards = {}
         self.w_list = set()
         self.r_list = set()
+        # self.e_list = set()
         self.max_buf_size = max_buf_size
 
     def get_forward_from_pool(self, sock):
@@ -234,10 +242,28 @@ class RRDServer(RemoteRedirection):
             if conn.sock is sock:
                 return conn
 
+    def clear_timeout_conns(self):
+        poll_live_time = 60
+        now = time.time()
+        for conn in list(self.conn_pool):
+            if (not conn.rbuf and now - conn.create > poll_live_time) \
+                    or now - conn.create > poll_live_time * 5:
+                logging.info("Close connection in conn_pool: %s:%s" % conn.addr)
+                self.r_list.discard(conn.sock)
+                self.conn_pool.remove(conn)
+                conn.sock.close()
+
+        for fw in list(self.forward_pool):
+            conn = fw.down if fw.down else fw.up
+            if not conn.rbuf and now - conn.create > poll_live_time:
+                fw.close()
+
     def main_loop(self):
         timeout = 0.1
         logging.info("RRDServer is running at %s:%s" % self.bind_addr)
         while True:
+            self.clear_timeout_conns()
+
             r_list, w_list, e_list = select.select(
                                 self.r_list, self.w_list, self.r_list, timeout)
             for sock in e_list:
@@ -275,7 +301,9 @@ class RRDServer(RemoteRedirection):
                         else:
                             tp = conn.type
                             if tp == conn.TP_PRIVATE:
-                                conn.rbuf = conn.rbuf[10:]  # strip head
+                                header_size = 10
+                                conn.rbuf = conn.rbuf[header_size:]  # strip head
+                                conn.rsize -= header_size
                                 fw = self.Forward(self, up=conn)
                                 self.conn_pool.remove(conn)
                                 self.forward_pool.append(fw)
@@ -301,6 +329,13 @@ class RRDServer(RemoteRedirection):
                     assert down.up is None
                     fw = up
                     fw.down = down.down
+                    # 拦截数据
+                    if fw.down.rbuf:
+                        rdata, sdata = fw.process_down_recv(fw.down.rbuf)
+                        if rdata is not None:
+                            fw.down.rbuf = rdata
+                        if sdata is not None:
+                            fw.up.rbuf += sdata
                     down.down = None
                     self.forward_pool.remove(up)
                     self.forward_pool.remove(down)
@@ -319,7 +354,8 @@ class RRDClient(RemoteRedirection):
         self.server_addr = server_addr
         self.Forward = forward if forward else Forward
 
-    err_flag = False    # a flag, same error will only be loged once.
+        self.err_flag = False    # a flag, same error will only be loged once.
+
     def create_conn(self, addr):
         sock = None
         try:
