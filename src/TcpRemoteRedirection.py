@@ -3,7 +3,7 @@
 # 
 # [up]Server <-> RRDClient <-> RRDServer <-> Client[down]
 # 
-#   RRDClient启动时，会创建一定数的连接连接到RRDServer，并发送长度为10个字节(格式为"{[(xxxx)]}")到RRDServer，用于标识为内部链接
+#   RRDClient启动时，会创建一定数量的连接连接到RRDServer，并发送长度为10个字节(格式为"{[(xxxx)]}")到RRDServer，用于标识为内部链接
 # 
 
 
@@ -66,8 +66,8 @@ class Connection(object):
         try:
             while True:
                 buf_left = self.max_buf_size - len(self.rbuf)
-                # if buf_left <= 0:
-                #     break
+                if buf_left <= 0:
+                    break
                 data = self.sock.recv(buf_left)
                 if data:
                     self.rbuf += data
@@ -116,7 +116,7 @@ class Forward(object):
             fmt = "Close forward. [Up rsize/szize: %d/%d], [Down rsize/ssize: %d/%d]"
             logging.debug(fmt, up.rsize, up.ssize, down.rsize, down.ssize)
         else:
-            logging.debug("Close private connection.")
+            logging.debug("Close [private-connection].")
         for conn in (up, down):
             if conn:
                 self.proxy._forwards.pop(conn.sock, None)
@@ -243,11 +243,11 @@ class RRDServer(RemoteRedirection):
                 return conn
 
     def clear_timeout_conns(self):
-        poll_live_time = 60
+        pool_live_time = 60
         now = time.time()
         for conn in list(self.conn_pool):
-            if (not conn.rbuf and now - conn.create > poll_live_time) \
-                    or now - conn.create > poll_live_time * 5:
+            if (not conn.rbuf and now - conn.create > pool_live_time) \
+                    or now - conn.create > pool_live_time * 5:
                 logging.info("Close connection in conn_pool: %s:%s" % conn.addr)
                 self.r_list.discard(conn.sock)
                 self.conn_pool.remove(conn)
@@ -255,7 +255,7 @@ class RRDServer(RemoteRedirection):
 
         for fw in list(self.forward_pool):
             conn = fw.down if fw.down else fw.up
-            if not conn.rbuf and now - conn.create > poll_live_time:
+            if not conn.connected or (not conn.rbuf and now - conn.create > pool_live_time):
                 fw.close()
 
     def main_loop(self):
@@ -354,7 +354,7 @@ class RRDClient(RemoteRedirection):
         self.server_addr = server_addr
         self.Forward = forward if forward else Forward
 
-        self.err_flag = False    # a flag, same error will only be loged once.
+        self.err_flag = False    # error log flag, same error will only be loged once.
 
     def create_conn(self, addr):
         sock = None
@@ -377,11 +377,11 @@ class RRDClient(RemoteRedirection):
 
     def full_poll(self):
         pool_size = 5
-        poll_live_time = 60
+        pool_live_time = 60
 
-        now = time.time()
+        now = time.time()           # 
         for fw in list(self.forward_pool):
-            if now - fw.down.create > poll_live_time:
+            if now - fw.down.create > pool_live_time:
                 fw.close()
 
         if len(self.forward_pool) < pool_size:
@@ -399,6 +399,7 @@ class RRDClient(RemoteRedirection):
         timeout = 0.1
         while True:
             self.full_poll()
+            
             r_list, w_list, e_list = select.select(self.r_list, self.w_list, self.r_list, timeout)
             for sock in e_list:
                 self._call(sock, "close")
