@@ -23,7 +23,8 @@ class Connection(object):
     TP_OPEN = 2         # 外部链接
     TP_UNKNOWN = 3      # 未知
 
-    def __init__(self, sock, addr, max_buf_size):
+    def __init__(self, proxy, sock, addr, max_buf_size):
+        self.proxy = proxy
         self.sock = sock
         self.addr = addr
         self.create = time.time()
@@ -103,6 +104,20 @@ class Connection(object):
     def connected(self):
         return self.recv() != -1
 
+    def close(self):
+        if self.sock:
+            proxy, sock = self.proxy, self.sock
+            proxy.r_list.discard(sock)
+            proxy.w_list.discard(sock)
+            proxy.x_list.discard(sock)
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            sock.close()
+            self.sock = None
+            self.proxy = None
+
 
 class Forward(object):
     def __init__(self, proxy, up=None, down=None):
@@ -111,20 +126,20 @@ class Forward(object):
         self.down = down
 
     def close(self):
-        up, down = self.up, self.down
+        up, down, proxy = self.up, self.down, self.proxy
+        if self in self.proxy.forward_pool:
+            self.proxy.forward_pool.remove(self)
+
+        for conn in (up, down):
+            if conn:
+                proxy._forwards.pop(conn.sock, None)
+                conn.close()
+
         if up and down:
             fmt = "Close forward. [Up rsize/szize: %d/%d], [Down rsize/ssize: %d/%d]"
             logging.debug(fmt, up.rsize, up.ssize, down.rsize, down.ssize)
         else:
             logging.debug("Close [private-connection].")
-        for conn in (up, down):
-            if conn:
-                self.proxy._forwards.pop(conn.sock, None)
-                self.proxy.r_list.discard(conn.sock)
-                self.proxy.w_list.discard(conn.sock)
-                conn.sock.close()
-        if self in self.proxy.forward_pool:
-            self.proxy.forward_pool.remove(self)
 
     def on_recv(self, sock):
         if self.up and sock is self.up.sock:
@@ -201,7 +216,7 @@ class RemoteRedirection(object):
         self._forwards = {}
         self.w_list = set()
         self.r_list = set()
-        # self.e_list = set()
+        self.x_list = set()
         self.max_buf_size = max_buf_size
 
     def get_forward_from_pool(self, sock):
@@ -217,9 +232,14 @@ class RemoteRedirection(object):
         if fw:
             getattr(fw, method)(sock)
         else:   # never happen
-            logging.error("Close [unkown connection].")
+            logging.error("Close [unkown socket].")
             self.r_list.discard(sock)
             self.w_list.discard(sock)
+            self.x_list.discard(sock)
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             sock.close()
 
 
@@ -249,14 +269,15 @@ class RRDServer(RemoteRedirection):
             if (not conn.rbuf and now - conn.create > pool_live_time) \
                     or now - conn.create > pool_live_time * 5:
                 logging.info("Close connection in conn_pool: %s:%s" % conn.addr)
-                self.r_list.discard(conn.sock)
                 self.conn_pool.remove(conn)
-                conn.sock.close()
+                conn.close()
 
         for fw in list(self.forward_pool):
             conn = fw.down if fw.down else fw.up
+            # 在测试中发现, 在windows系统中,在nat墙内,使用端口映射,RRDServer运行一段时间后,一部分死掉的链接无法检测到.
             if not conn.connected or (not conn.rbuf and now - conn.create > pool_live_time):
                 fw.close()
+
 
     def main_loop(self):
         timeout = 0.1
@@ -264,15 +285,13 @@ class RRDServer(RemoteRedirection):
         while True:
             self.clear_timeout_conns()
 
-            r_list, w_list, e_list = select.select(
-                                self.r_list, self.w_list, self.r_list, timeout)
-            for sock in e_list:
+            r_list, w_list, x_list = select.select(
+                                self.r_list, self.w_list, self.x_list, timeout)
+            for sock in x_list:
                 conn = self.get_conn_from_pool(sock)
                 if conn:
                     self.conn_pool.remove(conn)
-                    self.w_list.discard(sock)
-                    self.r_list.discard(sock)
-                    sock.close()
+                    conn.close()
                 else:
                     self._call(sock, "close")
             for sock in r_list:
@@ -281,11 +300,12 @@ class RRDServer(RemoteRedirection):
                         try:
                             client, client_addr = sock.accept()
                             client.setblocking(0)
-                            conn = Connection(client, client_addr, self.max_buf_size)
+                            conn = Connection(self, client, client_addr, self.max_buf_size)
                             # we don't know it's a private-connection or open-connection, put it to conn_pool first.
                             self.conn_pool.append(conn) 
                             logging.debug("Accept [%s:%s]" % client_addr)
                             self.r_list.add(client)
+                            self.x_list.add(client)
                         except socket.error, e:
                             if e.args[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
                                 break
@@ -295,9 +315,8 @@ class RRDServer(RemoteRedirection):
                     if conn:
                         rsize = conn.recv()
                         if rsize == -1:
-                            self.r_list.discard(sock)
-                            sock.close()
                             self.conn_pool.remove(conn)
+                            conn.close()
                         else:
                             tp = conn.type
                             if tp == conn.TP_PRIVATE:
@@ -363,20 +382,20 @@ class RRDClient(RemoteRedirection):
             sock.connect(addr)
             sock.setblocking(0)
             self.r_list.add(sock)
+            self.x_list.add(sock)
             # logging.debug("Create a conn to [%s:%s]" % addr)
             self.err_flag = False
-            return Connection(sock, sock.getsockname(), self.max_buf_size)
+            return Connection(self, sock, sock.getsockname(), self.max_buf_size)
         except socket.error, e:
             if e.args[0] not in (errno.EINPROGRESS, errno.EWOULDBLOCK):
-                pass    # server busy
-            if not self.err_flag:
-                logging.warning("Connect to [%s:%s] fail: %s", addr[0], addr[1], e)
-                self.err_flag = True
-            if sock:
-                sock.close()
+                if not self.err_flag:
+                    logging.warning("Connect to [%s:%s] fail: %s", addr[0], addr[1], e)
+                    self.err_flag = True
+                if sock:
+                    sock.close()
 
     def full_poll(self):
-        pool_size = 5
+        pool_size = 3
         pool_live_time = 60
 
         now = time.time()           # 
@@ -389,10 +408,14 @@ class RRDClient(RemoteRedirection):
                 conn = self.create_conn(self.rrd_server_addr)
                 if not conn:
                     break
-                conn.sock.send("{[(%04d)]}" % random.randint(1, 9999))    # send private-connection flag
-                fw = self.Forward(self, down=conn)
-                self.forward_pool.append(fw)
-                logging.info("Create [private-connection] to RRDServer[%s:%s]." % self.rrd_server_addr)
+                ssize = conn.sock.send("{[(%04d)]}" % random.randint(1, 9999))    # send private-connection flag
+                if ssize == 10:
+                    fw = self.Forward(self, down=conn)
+                    self.forward_pool.append(fw)
+                    logging.info("Create [private-connection] to RRDServer[%s:%s]." % self.rrd_server_addr)
+                else:
+                    conn.close()
+                    logging.warning("Send private-key to RRDServer[%s:%s] fail: bad network." % self.rrd_server_addr)
 
 
     def main_loop(self):
@@ -400,8 +423,8 @@ class RRDClient(RemoteRedirection):
         while True:
             self.full_poll()
             
-            r_list, w_list, e_list = select.select(self.r_list, self.w_list, self.r_list, timeout)
-            for sock in e_list:
+            r_list, w_list, x_list = select.select(self.r_list, self.w_list, self.x_list, timeout)
+            for sock in x_list:
                 self._call(sock, "close")
             for sock in r_list:
                 fw = self.get_forward_from_pool(sock)
@@ -441,7 +464,7 @@ if __name__ == '__main__':
         server.main_loop()
     else:
         rrd_server = ("127.0.0.1", 1234)
-        server = ("127.0.0.1", 22)
+        server = ("192.168.31.1", 80)
         client = RRDClient(rrd_server, server)
         client.main_loop()
 

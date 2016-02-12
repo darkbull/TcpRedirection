@@ -32,6 +32,8 @@ class Connection(object):
         try:
             while True:
                 buf_left = self.max_buf_size - len(self.rbuf)
+                if buf_left <= 0:
+                    break
                 data = self.sock.recv(buf_left)
                 if data:
                     self.rbuf += data
@@ -82,6 +84,9 @@ class Forward(object):
         proxy._forwards[remote] = self
         proxy.r_list.add(client)
         proxy.r_list.add(remote)
+        proxy.x_list.add(client)
+        proxy.x_list.add(remote)
+        logging.info("Create forward.")
 
     def close(self):
         for conn in (self.up, self.down):
@@ -89,7 +94,9 @@ class Forward(object):
             self.proxy._forwards.pop(sock, None)
             self.proxy.r_list.discard(sock)
             self.proxy.w_list.discard(sock)
+            self.proxy.x_list.discard(sock)
             sock.close()
+        logging.info("Close forward.")
 
     def on_recv(self, sock):
         if self.up.sock is sock:
@@ -168,7 +175,7 @@ class TcpLocalRedirection(object):
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(0)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR  , 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(bind_addr)
         sock.listen(200)
         self.server = sock
@@ -177,6 +184,7 @@ class TcpLocalRedirection(object):
         self._forwards = {}
         self.w_list = set()
         self.r_list = set()
+        self.x_list = set()
         self.r_list.add(self.server)
 
     def main_loop(self):
@@ -188,12 +196,13 @@ class TcpLocalRedirection(object):
                 logging.error("Close [unkown connection].")
                 self.r_list.discard(sock)
                 self.w_list.discard(sock)
+                self.x_list.discard(sock)
                 sock.close()
 
         timeout = 0.1
         while True:
-            r_list, w_list, e_list = select.select(self.r_list, self.w_list, self.r_list, timeout)
-            for sock in e_list:
+            r_list, w_list, x_list = select.select(self.r_list, self.w_list, self.x_list, timeout)
+            for sock in x_list:
                 call(sock, "close")
             for sock in r_list:
                 if sock is self.server:
